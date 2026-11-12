@@ -380,3 +380,7 @@ for df in (train_p, val_p, test_p):
     df[CILJEVI] = np.log10(df[CILJEVI])
 
 print(train_p[CILJEVI].describe().round(3).to_string())
+
+
+print("Duplikati po id:", podskup_cist["id"].duplicated().sum())
+print("Potpuno isti redovi (bez id):", podskup_cist.drop(columns="id").duplicated().sum())
