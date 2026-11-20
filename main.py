@@ -2,17 +2,18 @@ import re
 from itertools import combinations
 from pathlib import Path
 from scipy import stats
-
+import copy
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torchvision import transforms
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-
+import torch.nn.functional as F
 
 
 INDEKS = "RN 101/2024"  # <-- upisite svoj broj indeksa
@@ -76,7 +77,7 @@ for ax, id_, vrednosti in zip(axes.flat, primeri["id"], primeri[CILJEVI].to_nump
     ax.set_title("\n".join(f"{c} = {v:.3g}" for c, v in zip(CILJEVI, vrednosti)), fontsize=9)
     ax.axis("off")
 plt.tight_layout()
-plt.show()
+#plt.show()
 
 
 class PlantTraitsDataset(Dataset):
@@ -142,7 +143,7 @@ for ax in axes.flat:
 
 plt.suptitle("Distribution of target variables: original vs log scale")
 plt.tight_layout()
-plt.show()
+#plt.show()
 
 
 def show_extremes(column, n=8):
@@ -195,7 +196,7 @@ plt.xlabel("log10(X18_mean) - height")
 plt.ylabel("log10(X26_mean) - seed mass")
 plt.title("Height vs seed mass, r = {r:.2f}")
 
-plt.show()
+#plt.show()
 
 
 # print(podskup.describe().index.tolist())
@@ -233,7 +234,7 @@ for ax, c in zip(axes, CILJEVI):
 plt.suptitle("Vegetation density (NDVI) vs plant traits")
 plt.tight_layout()
 plt.savefig("ndvi_vs_traits.png", dpi=150)
-plt.show()
+#plt.show()
 
 
 tab_skew = podskup_cist[TAB_KOLONE].skew()
@@ -252,7 +253,7 @@ axes[0].axvline(1, color="red", linestyle=":", linewidth=1)
 axes[0].axvline(-1, color="red", linestyle=":", linewidth=1)
 plt.tight_layout()
 plt.savefig("tabular_moments.png", dpi=150)
-plt.show()
+#plt.show()
 
 
 def kanal(c):
@@ -292,7 +293,7 @@ for j, cilj in enumerate(CILJEVI):
 fig.colorbar(im, ax=axes, label="Pearson r")
 fig.suptitle("Correlation of MODIS and VOD columns with targets")
 plt.savefig("corr_heatmap.png", dpi=150)
-plt.show()
+#plt.show()
 
 for cilj in CILJEVI:
     print(f"\nNajjace korelacije sa {cilj}:")
@@ -382,5 +383,218 @@ for df in (train_p, val_p, test_p):
 print(train_p[CILJEVI].describe().round(3).to_string())
 
 
-print("Duplikati po id:", podskup_cist["id"].duplicated().sum())
-print("Potpuno isti redovi (bez id):", podskup_cist.drop(columns="id").duplicated().sum())
+#metrika
+
+def r2_po_cilju(y_true, y_pred):
+    ss_res = ((y_true - y_pred) ** 2).sum(axis=0)
+    ss_tot = ((y_true - y_true.mean(axis=0)) ** 2).sum(axis=0)
+    return 1 - ss_res / ss_tot
+
+def predict(model, loader):
+    model.eval()
+    preds, ys = [], []
+    with torch.no_grad():
+        for x, y in loader:
+            preds.append(model(x.to(device)).cpu().numpy())
+            ys.append(y.numpy())
+    return np.concatenate(ys), np.concatenate(preds)
+
+#Model
+
+class Net(nn.Module):
+    def __init__(self, n_features, hidden_size=64, use_dropout=False):
+        super().__init__()
+        self.fc1 = nn.Linear(n_features, hidden_size)
+        self.fc1_drop = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc2_drop = nn.Dropout(0.3)
+        self.fc3 = nn.Linear(hidden_size, 2)
+
+        self.activation_function = nn.ReLU()
+        self.use_dropout = use_dropout
+
+    def forward(self, x):
+        x = self.activation_function(self.fc1(x))
+        if self.use_dropout:
+            x = self.fc1_drop(x)
+
+        x = self.activation_function(self.fc2(x))
+        if self.use_dropout:
+            x = self.fc2_drop(x)
+
+        x = self.fc3(x)
+        return x
+
+def train_one_epoch(model, train_loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0.0
+
+    for x, y in train_loader:
+        x, y = x.to(device), y.to(device)
+
+        optimizer.zero_grad()
+        pred = model(x)
+        loss = criterion(pred, y)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * len(x)
+
+    return total_loss / len(train_loader.dataset)
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def make_loader(df, shuffle):
+    X = torch.tensor(df[TAB_KOLONE].to_numpy(dtype=np.float32))
+    y = torch.tensor(df[CILJEVI].to_numpy(dtype=np.float32))
+    return DataLoader(TensorDataset(X,y), batch_size=32, shuffle=shuffle)
+
+train_loader = make_loader(train_p, shuffle=True)
+val_loader = make_loader(val_p, shuffle=True)
+
+
+def evaluate(model, loader, criterion):
+    model.eval()
+    total_loss = 0.0
+
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x)
+            total_loss += criterion(pred, y).item() * len(x)
+
+    return total_loss / len(loader.dataset)
+
+
+
+torch.manual_seed(SEED)
+model = Net(n_features=len(TAB_KOLONE), use_dropout=True).to(device)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.001)
+
+best_val_loss = float("inf")
+best_state = None
+best_epoch = 0
+
+for epoch in range(1, 51):
+    train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+    val_loss = evaluate(model, val_loader, criterion)
+
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_state = copy.deepcopy(model.state_dict())
+        best_epoch = epoch
+
+    print(f"Epoch {epoch:3d} | train loss {train_loss:.4f} | val loss {val_loss:.4f}")
+
+model.load_state_dict(best_state)
+print(f"\nNajbolja epoha: {best_epoch}, val loss {best_val_loss:.4f}")
+
+y_val, p_val = predict(model, val_loader)
+r2 = r2_po_cilju(y_val, p_val)
+print(f"Val R2: X18 = {r2[0]:.3f}, X26 = {r2[1]:.3f}, prosek = {r2.mean():.3f}")
+
+
+y_train = train_p[CILJEVI].to_numpy()
+baseline = np.tile(y_train.mean(axis=0), (len(y_val), 1))
+r2_base = r2_po_cilju(y_val, baseline)
+print(f"Trivijalno R2: X18 = {r2_base[0]:.3f}, X26 = {r2_base[1]:.3f}, prosek = {r2_base.mean():.3f}")
+
+
+#cnn
+
+
+IMG_SIZE = 128
+
+def load_images(df):
+    return [Image.open(SLIKE_DIR / f"{int(i)}.jpeg").convert("RGB").resize((IMG_SIZE, IMG_SIZE)) for i in df["id"]]
+
+train_imgs = load_images(train_p)
+val_imgs = load_images(val_p)
+
+arr = np.stack([np.asarray(img, dtype=np.float32) / 255.0 for img in train_imgs])
+img_mean = arr.mean(axis=(0, 1, 2))
+img_std = arr.std(axis=(0, 1, 2))
+del arr
+print("Image mean (R,G,B):", img_mean.round(3), "| std:", img_std.round(3))
+
+train_tf = transforms.Compose([
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize(img_mean.tolist(), img_std.tolist()),
+])
+eval_tf = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(img_mean.tolist(), img_std.tolist()),
+])
+
+
+class ImageDataset(Dataset):
+    def __init__(self, images, df, transform):
+        self.images = images
+        self.y = torch.tensor(df[CILJEVI].to_numpy(dtype=np.float32))
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, i):
+        return self.transform(self.images[i]), self.y[i]
+
+
+train_img_loader = DataLoader(ImageDataset(train_imgs, train_p, train_tf), batch_size=32, shuffle=True)
+val_img_loader = DataLoader(ImageDataset(val_imgs, val_p, eval_tf), batch_size=32, shuffle=False)
+
+
+class CNNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
+        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+        self.conv3 = nn.Conv2d(32, 64, 3, padding=1)
+        self.max_pool = nn.MaxPool2d(2)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+
+        self.fc1 = nn.Linear(64, 32)
+        self.fc1_drop = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(32, 2)
+
+    def forward(self, x):
+        x = self.max_pool(F.relu(self.conv1(x)))
+        x = self.max_pool(F.relu(self.conv2(x)))
+        x = self.max_pool(F.relu(self.conv3(x)))
+
+        x = self.gap(x)
+        x = torch.flatten(x, 1)
+
+        x = self.fc1_drop(F.relu(self.fc1(x)))
+        x = self.fc2(x)
+        return x
+
+
+torch.manual_seed(SEED)
+cnn = CNNet().to(device)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(cnn.parameters(), lr=0.001, weight_decay=0.0001)
+
+best_val_loss = float("inf")
+best_state = None
+best_epoch = 0
+
+for epoch in range(1, 41):
+    train_loss = train_one_epoch(cnn, train_img_loader, optimizer, criterion, device)
+    val_loss = evaluate(cnn, val_img_loader, criterion)
+    if val_loss < best_val_loss:
+        best_val_loss, best_state, best_epoch = val_loss, copy.deepcopy(cnn.state_dict()), epoch
+    print(f"Epoch {epoch:3d} | train loss {train_loss:.4f} | val loss {val_loss:.4f}")
+
+
+cnn.load_state_dict(best_state)
+print(f"\nNajbolja epoha: {best_epoch}, val loss {best_val_loss:.4f}")
+
+y_val_img, p_val_img = predict(cnn, val_img_loader)
+r2_cnn = r2_po_cilju(y_val_img, p_val_img)
+print(f"CNN Val R2: X18 = {r2_cnn[0]:.3f}, X26 = {r2_cnn[1]:.3f}, prosek = {r2_cnn.mean():.3f}")
+
+
