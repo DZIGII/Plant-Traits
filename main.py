@@ -14,6 +14,8 @@ from torchvision import transforms
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import torch.nn.functional as F
+from torchvision.models import resnet18, ResNet18_Weights
+
 
 
 INDEKS = "RN 101/2024"  # <-- upisite svoj broj indeksa
@@ -597,4 +599,82 @@ y_val_img, p_val_img = predict(cnn, val_img_loader)
 r2_cnn = r2_po_cilju(y_val_img, p_val_img)
 print(f"CNN Val R2: X18 = {r2_cnn[0]:.3f}, X26 = {r2_cnn[1]:.3f}, prosek = {r2_cnn.mean():.3f}")
 
+#Model 3 (cnn + sve kolone)
 
+
+resnet = resnet18(weights=ResNet18_Weights.DEFAULT)
+resnet.fc = nn.Identity()
+resnet = resnet.to(device).eval()
+
+resnet_tf = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+@torch.no_grad()
+def extract_features(df, batch_size=64):
+    features = []
+    ids = df["id"].to_numpy()
+    for start in range(0, len(ids), batch_size):
+        batch = torch.stack([
+            resnet_tf(Image.open(SLIKE_DIR / f"{int(i)}.jpeg").convert("RGB"))
+            for i in ids[start:start + batch_size]
+        ]).to(device)
+        features.append(resnet(batch).cpu().numpy())
+    return np.concatenate(features)
+
+img_train = extract_features(train_p)
+img_val = extract_features(val_p)
+img_test = extract_features(test_p)
+print("Image features:", img_train.shape, img_val.shape, img_test.shape)
+
+
+scaler_img = StandardScaler().fit(img_train)
+img_train_s = scaler_img.transform(img_train)
+img_val_s = scaler_img.transform(img_val)
+img_test_s = scaler_img.transform(img_test)
+
+tab_train = train_p[TAB_KOLONE].to_numpy(dtype=np.float32)
+tab_val = val_p[TAB_KOLONE].to_numpy(dtype=np.float32)
+tab_test = test_p[TAB_KOLONE].to_numpy(dtype=np.float32)
+
+y_train_np = train_p[CILJEVI].to_numpy(dtype=np.float32)
+y_val_np = val_p[CILJEVI].to_numpy(dtype=np.float32)
+y_test_np = test_p[CILJEVI].to_numpy(dtype=np.float32)
+
+fused_train = np.hstack([img_train_s, tab_train])
+fused_val = np.hstack([img_val_s, tab_val])
+fused_test = np.hstack([img_test_s, tab_test])
+
+
+def to_loader(X, y, shuffle):
+    return DataLoader(TensorDataset(torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)), batch_size=32, shuffle=shuffle)
+
+
+def train_mlp(X_tr, y_tr, X_va, y_va, epochs=100):
+    tr_loader = to_loader(X_tr, y_tr, shuffle=True)
+    va_loader = to_loader(X_va, y_va, shuffle=False)
+
+    torch.manual_seed(SEED)
+    model = Net(n_features=X_tr.shape[1], use_dropout=True).to(device)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-3)
+
+    best_val_loss, best_state, best_epoch = float("inf"), None, 0
+    for epoch in range(1, epochs + 1):
+        train_one_epoch(model, tr_loader, optimizer, criterion, device)
+        val_loss = evaluate(model, va_loader, criterion)
+        if val_loss < best_val_loss:
+            best_val_loss, best_state, best_epoch = val_loss, copy.deepcopy(model.state_dict()), epoch
+
+    model.load_state_dict(best_state)
+    y_true, y_pred = predict(model, va_loader)
+    return model, r2_po_cilju(y_true, y_pred), best_epoch
+
+
+model_img, r2_img, ep_img = train_mlp(img_train_s, y_train_np, img_val_s, y_val_np)
+print(f"ResNet slika:   X18 = {r2_img[0]:.3f}, X26 = {r2_img[1]:.3f}, prosek = {r2_img.mean():.3f} (epoha {ep_img})")
+
+model_v3, r2_v3, ep_v3 = train_mlp(fused_train, y_train_np, fused_val, y_val_np)
+print(f"V3 slika+tabela: X18 = {r2_v3[0]:.3f}, X26 = {r2_v3[1]:.3f}, prosek = {r2_v3.mean():.3f} (epoha {ep_v3})")
