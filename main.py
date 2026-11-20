@@ -145,7 +145,8 @@ for ax in axes.flat:
 
 plt.suptitle("Distribution of target variables: original vs log scale")
 plt.tight_layout()
-#plt.show()
+plt.savefig("ciljevi_raspodela.png", dpi=150)
+plt.show()
 
 
 def show_extremes(column, n=8):
@@ -584,7 +585,7 @@ best_val_loss = float("inf")
 best_state = None
 best_epoch = 0
 
-for epoch in range(1, 41):
+for epoch in range(1, 101):
     train_loss = train_one_epoch(cnn, train_img_loader, optimizer, criterion, device)
     val_loss = evaluate(cnn, val_img_loader, criterion)
     if val_loss < best_val_loss:
@@ -678,3 +679,54 @@ print(f"ResNet slika:   X18 = {r2_img[0]:.3f}, X26 = {r2_img[1]:.3f}, prosek = {
 
 model_v3, r2_v3, ep_v3 = train_mlp(fused_train, y_train_np, fused_val, y_val_np)
 print(f"V3 slika+tabela: X18 = {r2_v3[0]:.3f}, X26 = {r2_v3[1]:.3f}, prosek = {r2_v3.mean():.3f} (epoha {ep_v3})")
+
+
+
+assert model.fc1.in_features == len(TAB_KOLONE), "`model` vise nije V1 (MLP nad tabelom)"
+
+test_imgs = load_images(test_p)
+
+modeli = {
+    "V1: MLP, tabela": (
+        model,
+        make_loader(val_p, shuffle=False),
+        make_loader(test_p, shuffle=False),
+    ),
+    "V2: CNN od nule, slika": (
+        cnn,
+        DataLoader(ImageDataset(val_imgs, val_p, eval_tf), batch_size=32, shuffle=False),
+        DataLoader(ImageDataset(test_imgs, test_p, eval_tf), batch_size=32, shuffle=False),
+    ),
+    "ResNet18, slika": (
+        model_img,
+        to_loader(img_val_s, y_val_np, shuffle=False),
+        to_loader(img_test_s, y_test_np, shuffle=False),
+    ),
+    "V3: ResNet18 + tabela": (
+        model_v3,
+        to_loader(fused_val, y_val_np, shuffle=False),
+        to_loader(fused_test, y_test_np, shuffle=False),
+    ),
+}
+
+redovi = []
+
+mean_train = y_train_np.mean(axis=0)
+r2_v = r2_po_cilju(y_val_np, np.tile(mean_train, (len(y_val_np), 1)))
+r2_t = r2_po_cilju(y_test_np, np.tile(mean_train, (len(y_test_np), 1)))
+redovi.append({"Model": "Trivijalno", "Val X18": r2_v[0], "Val X26": r2_v[1],
+               "Test X18": r2_t[0], "Test X26": r2_t[1]})
+
+for ime, (m, val_loader_m, test_loader_m) in modeli.items():
+    r2_v = r2_po_cilju(*predict(m, val_loader_m))
+    r2_t = r2_po_cilju(*predict(m, test_loader_m))
+    redovi.append({"Model": ime, "Val X18": r2_v[0], "Val X26": r2_v[1],
+                   "Test X18": r2_t[0], "Test X26": r2_t[1]})
+
+rezultati = pd.DataFrame(redovi).set_index("Model")
+rezultati["Val prosek"] = rezultati[["Val X18", "Val X26"]].mean(axis=1)
+rezultati["Test prosek"] = rezultati[["Test X18", "Test X26"]].mean(axis=1)
+
+print("\nR2 (log10 skala), validacija i test:")
+print(rezultati.round(3).to_string())
+rezultati.round(3).to_csv("rezultati.csv")

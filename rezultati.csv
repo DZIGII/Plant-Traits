@@ -1,0 +1,6 @@
+Model,Val X18,Val X26,Test X18,Test X26,Val prosek,Test prosek
+Trivijalno,-0.0,-0.001,-0.0,-0.0,-0.0,-0.0
+"V1: MLP, tabela",0.179,0.105,0.174,0.077,0.142,0.125
+"V2: CNN od nule, slika",0.097,0.065,0.116,0.076,0.081,0.096
+"ResNet18, slika",0.322,0.129,0.28,0.092,0.225,0.186
+V3: ResNet18 + tabela,0.394,0.142,0.32,0.104,0.268,0.212
